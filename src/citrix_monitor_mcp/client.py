@@ -88,7 +88,7 @@ class CitrixMonitorClient:
         token_data = response.json()
         self._token = token_data["access_token"]
         # Token typically expires in 1 hour, refresh 5 minutes early
-        expires_in = token_data.get("expires_in", 3600)
+        expires_in = int(token_data.get("expires_in", 3600))
         self._token_expiry = datetime.now() + timedelta(seconds=expires_in - 300)
 
         return self._token
