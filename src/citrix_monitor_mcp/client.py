@@ -3,13 +3,20 @@
 import os
 import time
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 import requests
 from dotenv import load_dotenv
 from requests_ntlm import HttpNtlmAuth
 
+# Try loading .env from multiple locations
+# 1. Current working directory (default)
+# 2. Package installation directory (for MCP usage)
 load_dotenv()
+_pkg_env = Path(__file__).parent.parent.parent / ".env"
+if _pkg_env.exists():
+    load_dotenv(_pkg_env)
 
 
 class CitrixMonitorClient:
