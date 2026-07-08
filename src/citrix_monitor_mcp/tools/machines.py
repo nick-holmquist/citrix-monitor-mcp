@@ -67,6 +67,7 @@ def get_tools() -> list[Tool]:
                     },
                 },
                 "required": [],
+                "anyOf": [{"required": ["machine_id"]}, {"required": ["name"]}],
             },
         ),
         Tool(

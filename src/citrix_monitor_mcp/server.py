@@ -21,53 +21,52 @@ from .tools import (
 
 server = Server("citrix-monitor-mcp")
 
+_TOOL_MODULES = (machines, sessions, connections, applications, users, analytics, diagnostics)
+
 
 def format_result(result: Any) -> str:
     """Format result as JSON string."""
     return json.dumps(result, indent=2, default=str)
 
 
+def _build_tool_registry() -> dict[str, Any]:
+    """Map each tool name to the module that handles it (built once at import)."""
+    registry: dict[str, Any] = {}
+    for module in _TOOL_MODULES:
+        for tool in module.get_tools():
+            registry[tool.name] = module
+    return registry
+
+
+_TOOL_REGISTRY = _build_tool_registry()
+
+
 @server.list_tools()
 async def list_tools() -> list[Tool]:
     """List all available tools."""
     tools = []
-    tools.extend(machines.get_tools())
-    tools.extend(sessions.get_tools())
-    tools.extend(connections.get_tools())
-    tools.extend(applications.get_tools())
-    tools.extend(users.get_tools())
-    tools.extend(analytics.get_tools())
-    tools.extend(diagnostics.get_tools())
+    for module in _TOOL_MODULES:
+        tools.extend(module.get_tools())
     return tools
 
 
 @server.call_tool()
 async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
-    """Handle tool calls."""
-    try:
-        result = None
+    """Handle tool calls.
 
-        # Route to appropriate handler based on tool name prefix
-        if name.startswith("citrix_machine") or name.startswith("citrix_catalog"):
-            result = machines.handle_tool(name, arguments)
-        elif name.startswith("citrix_session"):
-            result = sessions.handle_tool(name, arguments)
-        elif name.startswith("citrix_connection") or name.startswith("citrix_failure"):
-            result = connections.handle_tool(name, arguments)
-        elif name.startswith("citrix_app"):
-            result = applications.handle_tool(name, arguments)
-        elif name.startswith("citrix_user"):
-            result = users.handle_tool(name, arguments)
-        elif name.startswith("citrix_probe") or name.startswith("citrix_task"):
-            result = diagnostics.handle_tool(name, arguments)
-        else:
-            # Analytics and other tools
-            result = analytics.handle_tool(name, arguments)
+    Handlers perform blocking HTTP I/O (requests + retry sleeps), so they run
+    in a worker thread via asyncio.to_thread — otherwise a single slow/rate
+    -limited call would stall the event loop and all other MCP traffic.
+    Exceptions are intentionally left to propagate: the MCP SDK's call_tool
+    wrapper catches them and returns a CallToolResult with isError=True,
+    which is the spec-correct way to signal a tool failure.
+    """
+    module = _TOOL_REGISTRY.get(name)
+    if module is None:
+        raise ValueError(f"Unknown tool: {name}")
 
-        return [TextContent(type="text", text=format_result(result))]
-
-    except Exception as e:
-        return [TextContent(type="text", text=format_result({"error": str(e)}))]
+    result = await asyncio.to_thread(module.handle_tool, name, arguments)
+    return [TextContent(type="text", text=format_result(result))]
 
 
 async def run_server():

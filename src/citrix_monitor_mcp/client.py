@@ -1,14 +1,18 @@
 """Citrix Monitor Service OData API client."""
 
+import logging
 import os
+import re
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
 import requests
 from dotenv import load_dotenv
 from requests_ntlm import HttpNtlmAuth
+
+logger = logging.getLogger(__name__)
 
 # Try loading .env from multiple locations
 # 1. Current working directory (default)
@@ -17,6 +21,28 @@ load_dotenv()
 _pkg_env = Path(__file__).parent.parent.parent / ".env"
 if _pkg_env.exists():
     load_dotenv(_pkg_env)
+
+_GUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+
+
+def _odata_quote(value: str) -> str:
+    """Escape a string for safe embedding in a single-quoted OData string literal."""
+    return "'" + str(value).replace("'", "''") + "'"
+
+
+def _odata_key(value: str | int) -> str:
+    """Validate and format a GUID or integer key for unquoted OData literal use.
+
+    Monitor Service GUID/int keys are interpolated unquoted into $filter
+    expressions (per OData v4 syntax); reject anything that isn't actually
+    a GUID or integer so arbitrary filter clauses can't be injected here.
+    """
+    if isinstance(value, int):
+        return str(value)
+    text = str(value)
+    if _GUID_RE.match(text) or text.lstrip("-").isdigit():
+        return text
+    raise ValueError(f"Invalid entity key '{value}': expected a GUID or integer")
 
 
 class CitrixMonitorClient:
@@ -80,17 +106,26 @@ class CitrixMonitorClient:
         endpoint = self.CLOUD_ENDPOINTS.get(region, self.CLOUD_ENDPOINTS["us"])
         token_url = f"{endpoint}/cctrustoauth2/{customer_id}/tokens/clients"
 
-        response = requests.post(
-            token_url,
-            data={
-                "grant_type": "client_credentials",
-                "client_id": client_id,
-                "client_secret": client_secret,
-            },
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
-            verify=self.verify_ssl,
-        )
-        response.raise_for_status()
+        try:
+            response = requests.post(
+                token_url,
+                data={
+                    "grant_type": "client_credentials",
+                    "client_id": client_id,
+                    "client_secret": client_secret,
+                },
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+                verify=self.verify_ssl,
+            )
+            response.raise_for_status()
+        except requests.RequestException as e:
+            # Don't let the token endpoint URL (which embeds CITRIX_CUSTOMER_ID)
+            # or raw response body leak into the error surfaced to the MCP client.
+            logger.warning("Citrix Cloud token request failed: %s", e)
+            raise RuntimeError(
+                "Failed to obtain Citrix Cloud auth token. Check CITRIX_CUSTOMER_ID, "
+                "CITRIX_CLIENT_ID, CITRIX_CLIENT_SECRET, and network connectivity."
+            ) from None
 
         token_data = response.json()
         self._token = token_data["access_token"]
@@ -104,6 +139,11 @@ class CitrixMonitorClient:
     def session(self) -> requests.Session:
         """Get configured requests session with appropriate auth."""
         if self._session is None:
+            if not self.verify_ssl:
+                logger.warning(
+                    "CITRIX_VERIFY_SSL is disabled — TLS certificate validation is "
+                    "off for all Citrix API requests."
+                )
             self._session = requests.Session()
             self._session.verify = self.verify_ssl
 
@@ -256,7 +296,9 @@ class CitrixMonitorClient:
         Returns:
             Entity record or None if not found
         """
-        results = self.query(entity, filter=f"{key_field} eq {key}", expand=expand, top=1)
+        results = self.query(
+            entity, filter=f"{key_field} eq {_odata_key(key)}", expand=expand, top=1
+        )
         return results[0] if results else None
 
     def aggregate(self, entity: str, apply: str) -> dict[str, Any]:
@@ -365,7 +407,7 @@ class CitrixMonitorClient:
 
     def get_machine_by_name(self, name: str) -> dict[str, Any] | None:
         """Get machine by name."""
-        machines = self.query("Machines", filter=f"Name eq '{name}'", top=1)
+        machines = self.query("Machines", filter=f"Name eq {_odata_quote(name)}", top=1)
         return machines[0] if machines else None
 
     def get_machine_metrics(
@@ -382,7 +424,7 @@ class CitrixMonitorClient:
 
         return self.query(
             "ResourceUtilization",
-            filter=f"MachineId eq {machine_id}",
+            filter=f"MachineId eq {_odata_key(machine_id)}",
             orderby="CreatedDate desc",
         )
 
@@ -400,7 +442,7 @@ class CitrixMonitorClient:
 
         return self.query(
             "MachineFailureLogs",
-            filter=f"MachineId eq {machine_id}",
+            filter=f"MachineId eq {_odata_key(machine_id)}",
             orderby="FailureStartDate desc",
         )
 
@@ -426,9 +468,9 @@ class CitrixMonitorClient:
         if active_only:
             filters.append("EndDate eq null")
         if user_name:
-            filters.append(f"User/UserName eq '{user_name}'")
+            filters.append(f"User/UserName eq {_odata_quote(user_name)}")
         if machine_name:
-            filters.append(f"Machine/Name eq '{machine_name}'")
+            filters.append(f"Machine/Name eq {_odata_quote(machine_name)}")
 
         combined_filter = " and ".join(filters) if filters else None
         return self.query(
@@ -450,7 +492,7 @@ class CitrixMonitorClient:
         """Get logon duration breakdown for a session."""
         return self.query(
             "LogOnMetrics",
-            filter=f"SessionKey eq {session_key}",
+            filter=f"SessionKey eq {_odata_key(session_key)}",
         )
 
     def get_session_metrics(
@@ -465,7 +507,7 @@ class CitrixMonitorClient:
         if filter:
             filters.append(filter)
         if session_key:
-            filters.append(f"SessionId eq {session_key}")
+            filters.append(f"SessionId eq {_odata_key(session_key)}")
 
         combined_filter = " and ".join(filters) if filters else None
         return self.query("SessionMetrics", filter=combined_filter)
@@ -478,7 +520,7 @@ class CitrixMonitorClient:
         if filter:
             filters.append(filter)
 
-        start_date = (datetime.utcnow() - timedelta(days=days)).isoformat() + "Z"
+        start_date = (datetime.now(timezone.utc) - timedelta(days=days)).replace(tzinfo=None).isoformat() + "Z"
         filters.append(f"SummaryDate ge {start_date}")
 
         combined_filter = " and ".join(filters) if filters else None
@@ -502,7 +544,7 @@ class CitrixMonitorClient:
         if filter:
             filters.append(filter)
         if session_key:
-            filters.append(f"SessionKey eq {session_key}")
+            filters.append(f"SessionKey eq {_odata_key(session_key)}")
 
         combined_filter = " and ".join(filters) if filters else None
         return self.query(
@@ -530,7 +572,7 @@ class CitrixMonitorClient:
             filters.append(filter)
 
         # Default to last N days
-        start_date = (datetime.utcnow() - timedelta(days=days)).isoformat() + "Z"
+        start_date = (datetime.now(timezone.utc) - timedelta(days=days)).replace(tzinfo=None).isoformat() + "Z"
         filters.append(f"FailureDate ge {start_date}")
 
         combined_filter = " and ".join(filters) if filters else None
@@ -561,9 +603,9 @@ class CitrixMonitorClient:
         """List running application instances."""
         filters = []
         if app_id:
-            filters.append(f"ApplicationId eq {app_id}")
+            filters.append(f"ApplicationId eq {_odata_key(app_id)}")
         if app_name:
-            filters.append(f"Application/Name eq '{app_name}'")
+            filters.append(f"Application/Name eq {_odata_quote(app_name)}")
         if active_only:
             filters.append("EndDate eq null")
 
@@ -587,9 +629,9 @@ class CitrixMonitorClient:
         """
         filters = []
         if app_name:
-            filters.append(f"contains(ProcessName, '{app_name}')")
+            filters.append(f"contains(ProcessName, {_odata_quote(app_name)})")
 
-        start_date = (datetime.utcnow() - timedelta(days=days)).isoformat() + "Z"
+        start_date = (datetime.now(timezone.utc) - timedelta(days=days)).replace(tzinfo=None).isoformat() + "Z"
         filters.append(f"FaultReportedDate ge {start_date}")
 
         combined_filter = " and ".join(filters) if filters else None
@@ -610,9 +652,9 @@ class CitrixMonitorClient:
         """
         filters = []
         if app_name:
-            filters.append(f"contains(ProcessName, '{app_name}')")
+            filters.append(f"contains(ProcessName, {_odata_quote(app_name)})")
 
-        start_date = (datetime.utcnow() - timedelta(days=days)).isoformat() + "Z"
+        start_date = (datetime.now(timezone.utc) - timedelta(days=days)).replace(tzinfo=None).isoformat() + "Z"
         filters.append(f"ErrorReportedDate ge {start_date}")
 
         combined_filter = " and ".join(filters) if filters else None
@@ -628,9 +670,9 @@ class CitrixMonitorClient:
         """Get application usage rollups by time period."""
         filters = []
         if app_name:
-            filters.append(f"Application/Name eq '{app_name}'")
+            filters.append(f"Application/Name eq {_odata_quote(app_name)}")
 
-        start_date = (datetime.utcnow() - timedelta(days=days)).isoformat() + "Z"
+        start_date = (datetime.now(timezone.utc) - timedelta(days=days)).replace(tzinfo=None).isoformat() + "Z"
         filters.append(f"SummaryDate ge {start_date}")
 
         combined_filter = " and ".join(filters) if filters else None
@@ -655,7 +697,7 @@ class CitrixMonitorClient:
 
     def get_user_by_name(self, username: str) -> dict[str, Any] | None:
         """Get user by username."""
-        users = self.query("Users", filter=f"UserName eq '{username}'", top=1)
+        users = self.query("Users", filter=f"UserName eq {_odata_quote(username)}", top=1)
         return users[0] if users else None
 
     def get_user_sessions(
@@ -672,7 +714,7 @@ class CitrixMonitorClient:
 
         return self.query(
             "Sessions",
-            filter=f"UserId eq {user_id}",
+            filter=f"UserId eq {_odata_key(user_id)}",
             expand=["Machine"],
             orderby="StartDate desc",
         )
@@ -698,7 +740,7 @@ class CitrixMonitorClient:
             if machine:
                 machine_id = machine.get("Id")
 
-        filter = f"MachineId eq {machine_id}" if machine_id else None
+        filter = f"MachineId eq {_odata_key(machine_id)}" if machine_id else None
         return self.query(
             "LoadIndexes",
             filter=filter,
@@ -711,9 +753,9 @@ class CitrixMonitorClient:
         """Get failure summary counts."""
         filters = []
         if delivery_group:
-            filters.append(f"DesktopGroup/Name eq '{delivery_group}'")
+            filters.append(f"DesktopGroup/Name eq {_odata_quote(delivery_group)}")
 
-        start_date = (datetime.utcnow() - timedelta(days=days)).isoformat() + "Z"
+        start_date = (datetime.now(timezone.utc) - timedelta(days=days)).replace(tzinfo=None).isoformat() + "Z"
         filters.append(f"SummaryDate ge {start_date}")
 
         combined_filter = " and ".join(filters) if filters else None
@@ -738,9 +780,9 @@ class CitrixMonitorClient:
 
         filters = []
         if machine_id:
-            filters.append(f"MachineId eq {machine_id}")
+            filters.append(f"MachineId eq {_odata_key(machine_id)}")
 
-        start_date = (datetime.utcnow() - timedelta(days=days)).isoformat() + "Z"
+        start_date = (datetime.now(timezone.utc) - timedelta(days=days)).replace(tzinfo=None).isoformat() + "Z"
         filters.append(f"SummaryDate ge {start_date}")
 
         combined_filter = " and ".join(filters) if filters else None
@@ -782,9 +824,9 @@ class CitrixMonitorClient:
         if filter:
             filters.append(filter)
         if machine_id:
-            filters.append(f"MachineId eq {machine_id}")
+            filters.append(f"MachineId eq {_odata_key(machine_id)}")
 
-        start_date = (datetime.utcnow() - timedelta(days=days)).isoformat() + "Z"
+        start_date = (datetime.now(timezone.utc) - timedelta(days=days)).replace(tzinfo=None).isoformat() + "Z"
         filters.append(f"{date_field} ge {start_date}")
 
         combined_filter = " and ".join(filters) if filters else None

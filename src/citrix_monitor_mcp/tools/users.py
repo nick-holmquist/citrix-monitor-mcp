@@ -40,6 +40,7 @@ def get_tools() -> list[Tool]:
                     },
                 },
                 "required": [],
+                "anyOf": [{"required": ["user_id"]}, {"required": ["username"]}],
             },
         ),
         Tool(
