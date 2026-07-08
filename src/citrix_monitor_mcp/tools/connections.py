@@ -30,14 +30,15 @@ def get_tools() -> list[Tool]:
         ),
         Tool(
             name="citrix_connection_failures",
-            description="Get connection failure logs",
+            description=(
+                "Get connection failure logs. ConnectionFailureLogs has no DesktopGroup "
+                "navigation property, so delivery-group filtering isn't available here — "
+                "pass a custom filter against Machine/User/Session if you need to scope "
+                "by delivery group via one of those."
+            ),
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "delivery_group": {
-                        "type": "string",
-                        "description": "Filter by delivery group name",
-                    },
                     "days": {
                         "type": "integer",
                         "description": "Number of days to look back (default: 7)",
@@ -70,6 +71,15 @@ def get_tools() -> list[Tool]:
                 "required": [],
             },
         ),
+        Tool(
+            name="citrix_connection_failure_categories",
+            description="List connection failure category lookup values",
+            inputSchema={
+                "type": "object",
+                "properties": {},
+                "required": [],
+            },
+        ),
     ]
 
 
@@ -86,7 +96,6 @@ def handle_tool(name: str, arguments: dict[str, Any]) -> Any:
     elif name == "citrix_connection_failures":
         return client.get_connection_failures(
             filter=arguments.get("filter"),
-            delivery_group=arguments.get("delivery_group"),
             days=arguments.get("days", 7),
         )
 
@@ -95,6 +104,9 @@ def handle_tool(name: str, arguments: dict[str, Any]) -> Any:
             delivery_group=arguments.get("delivery_group"),
             days=arguments.get("days", 7),
         )
+
+    elif name == "citrix_connection_failure_categories":
+        return client.list_connection_failure_categories()
 
     else:
         raise ValueError(f"Unknown tool: {name}")

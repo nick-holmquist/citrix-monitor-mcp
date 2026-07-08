@@ -24,7 +24,20 @@ def get_tools() -> list[Tool]:
                     "power_state": {
                         "type": "string",
                         "description": "Filter by power state",
-                        "enum": ["On", "Off", "Suspended", "Unknown"],
+                        "enum": [
+                            "Unknown",
+                            "Unavailable",
+                            "Off",
+                            "On",
+                            "Suspended",
+                            "TurningOn",
+                            "TurningOff",
+                            "Suspending",
+                            "Resuming",
+                            "Unmanaged",
+                            "NotSupported",
+                            "VirtualMachineNotFound",
+                        ],
                     },
                     "in_maintenance": {
                         "type": "boolean",
@@ -45,8 +58,8 @@ def get_tools() -> list[Tool]:
                 "type": "object",
                 "properties": {
                     "machine_id": {
-                        "type": "integer",
-                        "description": "Machine ID",
+                        "type": "string",
+                        "description": "Machine ID (GUID, e.g. '31a02fb0-b673-4520-b94d-017fa2acd3b8')",
                     },
                     "name": {
                         "type": "string",
@@ -63,8 +76,8 @@ def get_tools() -> list[Tool]:
                 "type": "object",
                 "properties": {
                     "machine_id": {
-                        "type": "integer",
-                        "description": "Machine ID",
+                        "type": "string",
+                        "description": "Machine ID (GUID, e.g. '31a02fb0-b673-4520-b94d-017fa2acd3b8')",
                     },
                     "name": {
                         "type": "string",
@@ -81,12 +94,26 @@ def get_tools() -> list[Tool]:
                 "type": "object",
                 "properties": {
                     "machine_id": {
-                        "type": "integer",
-                        "description": "Machine ID",
+                        "type": "string",
+                        "description": "Machine ID (GUID, e.g. '31a02fb0-b673-4520-b94d-017fa2acd3b8')",
                     },
                     "name": {
                         "type": "string",
                         "description": "Machine name (alternative to machine_id)",
+                    },
+                },
+                "required": [],
+            },
+        ),
+        Tool(
+            name="citrix_catalog_list",
+            description="List machine catalogs in the Site",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "filter": {
+                        "type": "string",
+                        "description": "Custom OData filter expression",
                     },
                 },
                 "required": [],
@@ -129,6 +156,9 @@ def handle_tool(name: str, arguments: dict[str, Any]) -> Any:
             machine_id=arguments.get("machine_id"),
             name=arguments.get("name"),
         )
+
+    elif name == "citrix_catalog_list":
+        return client.list_catalogs(filter=arguments.get("filter"))
 
     else:
         raise ValueError(f"Unknown tool: {name}")

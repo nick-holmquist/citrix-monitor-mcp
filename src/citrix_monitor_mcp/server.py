@@ -8,7 +8,15 @@ from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import TextContent, Tool
 
-from .tools import machines, sessions, connections, applications, users, analytics
+from .tools import (
+    machines,
+    sessions,
+    connections,
+    applications,
+    users,
+    analytics,
+    diagnostics,
+)
 
 
 server = Server("citrix-monitor-mcp")
@@ -29,6 +37,7 @@ async def list_tools() -> list[Tool]:
     tools.extend(applications.get_tools())
     tools.extend(users.get_tools())
     tools.extend(analytics.get_tools())
+    tools.extend(diagnostics.get_tools())
     return tools
 
 
@@ -39,7 +48,7 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
         result = None
 
         # Route to appropriate handler based on tool name prefix
-        if name.startswith("citrix_machine"):
+        if name.startswith("citrix_machine") or name.startswith("citrix_catalog"):
             result = machines.handle_tool(name, arguments)
         elif name.startswith("citrix_session"):
             result = sessions.handle_tool(name, arguments)
@@ -49,6 +58,8 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
             result = applications.handle_tool(name, arguments)
         elif name.startswith("citrix_user"):
             result = users.handle_tool(name, arguments)
+        elif name.startswith("citrix_probe") or name.startswith("citrix_task"):
+            result = diagnostics.handle_tool(name, arguments)
         else:
             # Analytics and other tools
             result = analytics.handle_tool(name, arguments)

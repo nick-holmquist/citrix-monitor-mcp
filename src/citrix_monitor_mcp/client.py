@@ -150,8 +150,16 @@ class CitrixMonitorClient:
             response = self.session.request(method, url, **kwargs)
 
             if response.status_code == 429:
-                # Rate limited - wait and retry
-                wait_time = 5 * (attempt + 1)
+                # Rate limited - honor Retry-After if the server sent one,
+                # otherwise fall back to a fixed exponential backoff.
+                retry_after = response.headers.get("Retry-After")
+                if retry_after is not None:
+                    try:
+                        wait_time = float(retry_after)
+                    except ValueError:
+                        wait_time = 5 * (attempt + 1)
+                else:
+                    wait_time = 5 * (attempt + 1)
                 time.sleep(wait_time)
                 continue
 
@@ -169,7 +177,7 @@ class CitrixMonitorClient:
         skip: int | None = None,
         expand: list[str] | None = None,
         count: bool = False,
-    ) -> list[dict[str, Any]]:
+    ) -> list[dict[str, Any]] | dict[str, Any]:
         """Execute OData query with automatic pagination.
 
         Args:
@@ -180,10 +188,13 @@ class CitrixMonitorClient:
             top: Maximum records to return (per page if paginating)
             skip: Number of records to skip
             expand: List of related entities to expand
-            count: Include total count in response
+            count: If True, return {"count": total, "value": records} instead
+                of a bare list, where "count" is the server-reported total
+                matching the filter (independent of pagination/top).
 
         Returns:
-            List of entity records
+            List of entity records, or a dict with "count" and "value" when
+            count=True.
         """
         params = {}
         if filter:
@@ -202,6 +213,7 @@ class CitrixMonitorClient:
             params["$count"] = "true"
 
         results = []
+        total_count = None
         url = f"{self.base_url}/{entity}"
 
         while url:
@@ -209,39 +221,43 @@ class CitrixMonitorClient:
             response.raise_for_status()
             data = response.json()
 
+            if total_count is None and "@odata.count" in data:
+                total_count = data["@odata.count"]
+
             results.extend(data.get("value", []))
 
             # Follow pagination link if present
             url = data.get("@odata.nextLink")
             params = None  # Only use params on first request
 
+        if count:
+            return {"count": total_count, "value": results}
         return results
 
     def query_single(
-        self, entity: str, key: str | int, expand: list[str] | None = None
+        self,
+        entity: str,
+        key: str | int,
+        expand: list[str] | None = None,
+        key_field: str = "Id",
     ) -> dict[str, Any] | None:
-        """Query a single entity by key.
+        """Query a single entity by key field.
+
+        The Monitor Service OData endpoint does not support the standard
+        Entity(key) URL path-key-segment convention (it 404s even for valid
+        keys), so this looks the record up via $filter instead.
 
         Args:
             entity: Entity name
-            key: Entity key value
+            key: Entity key value (GUID or int; passed unquoted into the filter)
             expand: List of related entities to expand
+            key_field: Name of the key property to filter on (default "Id")
 
         Returns:
             Entity record or None if not found
         """
-        params = {}
-        if expand:
-            params["$expand"] = ",".join(expand)
-
-        url = f"{self.base_url}/{entity}({key})"
-        response = self._request_with_retry("GET", url, params=params or None)
-
-        if response.status_code == 404:
-            return None
-
-        response.raise_for_status()
-        return response.json()
+        results = self.query(entity, filter=f"{key_field} eq {key}", expand=expand, top=1)
+        return results[0] if results else None
 
     def aggregate(self, entity: str, apply: str) -> dict[str, Any]:
         """Execute OData aggregation query.
@@ -263,6 +279,10 @@ class CitrixMonitorClient:
     def get_count(self, entity: str, filter: str | None = None) -> int:
         """Get count of entities matching filter.
 
+        The Monitor Service OData endpoint does not support the /$count path
+        segment (it 404s), so this uses $count=true with $top=0 to get just
+        the total without transferring any records.
+
         Args:
             entity: Entity name
             filter: Optional OData $filter expression
@@ -270,16 +290,41 @@ class CitrixMonitorClient:
         Returns:
             Count of matching entities
         """
-        url = f"{self.base_url}/{entity}/$count"
-        params = {"$filter": filter} if filter else None
+        url = f"{self.base_url}/{entity}"
+        params = {"$count": "true", "$top": 0}
+        if filter:
+            params["$filter"] = filter
 
         response = self._request_with_retry("GET", url, params=params)
         response.raise_for_status()
-        return int(response.text)
+        return int(response.json().get("@odata.count", 0))
 
     # =========================================================================
     # Machine methods
     # =========================================================================
+
+    # OData enums are transmitted as integers, not strings (Monitor Service does
+    # not support Edm.String comparisons against enum-typed fields). Mappings
+    # per https://developer-docs.citrix.com/en-us/monitor-service-odata-api/monitor-service-enums.html
+    REGISTRATION_STATES = {
+        "Unknown": 0,
+        "Registered": 1,
+        "Unregistered": 2,
+    }
+    POWER_STATES = {
+        "Unknown": 0,
+        "Unavailable": 1,
+        "Off": 2,
+        "On": 3,
+        "Suspended": 4,
+        "TurningOn": 5,
+        "TurningOff": 6,
+        "Suspending": 7,
+        "Resuming": 8,
+        "Unmanaged": 9,
+        "NotSupported": 10,
+        "VirtualMachineNotFound": 11,
+    }
 
     def list_machines(
         self,
@@ -293,17 +338,29 @@ class CitrixMonitorClient:
         if filter:
             filters.append(filter)
         if registration_state:
-            filters.append(f"CurrentRegistrationState eq '{registration_state}'")
+            state_value = self.REGISTRATION_STATES.get(registration_state)
+            if state_value is None:
+                raise ValueError(
+                    f"Unknown registration_state '{registration_state}'. "
+                    f"Valid values: {sorted(self.REGISTRATION_STATES)}"
+                )
+            filters.append(f"CurrentRegistrationState eq {state_value}")
         if power_state:
-            filters.append(f"CurrentPowerState eq '{power_state}'")
+            state_value = self.POWER_STATES.get(power_state)
+            if state_value is None:
+                raise ValueError(
+                    f"Unknown power_state '{power_state}'. "
+                    f"Valid values: {sorted(self.POWER_STATES)}"
+                )
+            filters.append(f"CurrentPowerState eq {state_value}")
         if in_maintenance is not None:
             filters.append(f"IsInMaintenanceMode eq {str(in_maintenance).lower()}")
 
         combined_filter = " and ".join(filters) if filters else None
         return self.query("Machines", filter=combined_filter)
 
-    def get_machine(self, machine_id: int) -> dict[str, Any] | None:
-        """Get machine by ID."""
+    def get_machine(self, machine_id: str) -> dict[str, Any] | None:
+        """Get machine by ID (Machines.Id is an Edm.Guid, e.g. '31a02fb0-b673-4520-b94d-017fa2acd3b8')."""
         return self.query_single("Machines", machine_id)
 
     def get_machine_by_name(self, name: str) -> dict[str, Any] | None:
@@ -312,7 +369,7 @@ class CitrixMonitorClient:
         return machines[0] if machines else None
 
     def get_machine_metrics(
-        self, machine_id: int | None = None, name: str | None = None
+        self, machine_id: str | None = None, name: str | None = None
     ) -> list[dict[str, Any]]:
         """Get machine resource utilization metrics."""
         if name:
@@ -330,7 +387,7 @@ class CitrixMonitorClient:
         )
 
     def get_machine_failures(
-        self, machine_id: int | None = None, name: str | None = None
+        self, machine_id: str | None = None, name: str | None = None
     ) -> list[dict[str, Any]]:
         """Get machine failure logs."""
         if name:
@@ -346,6 +403,10 @@ class CitrixMonitorClient:
             filter=f"MachineId eq {machine_id}",
             orderby="FailureStartDate desc",
         )
+
+    def list_catalogs(self, filter: str | None = None) -> list[dict[str, Any]]:
+        """List machine catalogs."""
+        return self.query("Catalogs", filter=filter)
 
     # =========================================================================
     # Session methods
@@ -378,14 +439,53 @@ class CitrixMonitorClient:
         )
 
     def get_session(self, session_key: str) -> dict[str, Any] | None:
-        """Get session by key."""
-        return self.query_single("Sessions", f"'{session_key}'", expand=["User", "Machine"])
+        """Get session by key (Sessions.SessionKey is an Edm.Guid; the key
+        segment must be an unquoted GUID literal per OData v4, e.g.
+        Sessions(4569fdfd-54c4-44c8-81a9-40688a2771d6))."""
+        return self.query_single(
+            "Sessions", session_key, expand=["User", "Machine"], key_field="SessionKey"
+        )
 
     def get_logon_metrics(self, session_key: str) -> list[dict[str, Any]]:
         """Get logon duration breakdown for a session."""
         return self.query(
             "LogOnMetrics",
-            filter=f"SessionKey eq '{session_key}'",
+            filter=f"SessionKey eq {session_key}",
+        )
+
+    def get_session_metrics(
+        self, session_key: str | None = None, filter: str | None = None
+    ) -> list[dict[str, Any]]:
+        """Get per-session ICA/bandwidth metrics.
+
+        SessionMetrics has no SessionKey property — it keys sessions via
+        SessionId (an Edm.Guid matching Sessions.SessionKey's value).
+        """
+        filters = []
+        if filter:
+            filters.append(filter)
+        if session_key:
+            filters.append(f"SessionId eq {session_key}")
+
+        combined_filter = " and ".join(filters) if filters else None
+        return self.query("SessionMetrics", filter=combined_filter)
+
+    def get_session_activity_summary(
+        self, days: int = 7, filter: str | None = None
+    ) -> list[dict[str, Any]]:
+        """Get session count/logon activity rollups by time period."""
+        filters = []
+        if filter:
+            filters.append(filter)
+
+        start_date = (datetime.utcnow() - timedelta(days=days)).isoformat() + "Z"
+        filters.append(f"SummaryDate ge {start_date}")
+
+        combined_filter = " and ".join(filters) if filters else None
+        return self.query(
+            "SessionActivitySummaries",
+            filter=combined_filter,
+            orderby="SummaryDate desc",
         )
 
     # =========================================================================
@@ -402,7 +502,7 @@ class CitrixMonitorClient:
         if filter:
             filters.append(filter)
         if session_key:
-            filters.append(f"SessionKey eq '{session_key}'")
+            filters.append(f"SessionKey eq {session_key}")
 
         combined_filter = " and ".join(filters) if filters else None
         return self.query(
@@ -414,18 +514,22 @@ class CitrixMonitorClient:
     def get_connection_failures(
         self,
         filter: str | None = None,
-        delivery_group: str | None = None,
         days: int = 7,
     ) -> list[dict[str, Any]]:
-        """Get connection failure logs."""
+        """Get connection failure logs.
+
+        Note: ConnectionFailureLogs has no DesktopGroup navigation property
+        (fields are Id, SessionKey, FailureDate, UserId, MachineId,
+        ConnectionFailureEnumValue, Created/ModifiedDate; documented $expand
+        targets are Machine, User, Session only) — delivery-group filtering
+        is not supported here. Pass a custom `filter` against Machine/User/
+        Session if you need to scope by delivery group via one of those.
+        """
         filters = []
         if filter:
             filters.append(filter)
-        if delivery_group:
-            filters.append(f"DesktopGroup/Name eq '{delivery_group}'")
 
         # Default to last N days
-        from datetime import datetime, timedelta
         start_date = (datetime.utcnow() - timedelta(days=days)).isoformat() + "Z"
         filters.append(f"FailureDate ge {start_date}")
 
@@ -433,9 +537,12 @@ class CitrixMonitorClient:
         return self.query(
             "ConnectionFailureLogs",
             filter=combined_filter,
-            expand=["DesktopGroup"],
             orderby="FailureDate desc",
         )
+
+    def list_connection_failure_categories(self) -> list[dict[str, Any]]:
+        """List connection failure category lookup values."""
+        return self.query("ConnectionFailureCategories")
 
     # =========================================================================
     # Application methods
@@ -447,7 +554,7 @@ class CitrixMonitorClient:
 
     def list_app_instances(
         self,
-        app_id: int | None = None,
+        app_id: str | None = None,
         app_name: str | None = None,
         active_only: bool = False,
     ) -> list[dict[str, Any]]:
@@ -471,21 +578,67 @@ class CitrixMonitorClient:
     def get_app_errors(
         self, app_name: str | None = None, days: int = 7
     ) -> list[dict[str, Any]]:
-        """Get application errors/faults."""
+        """Get application faults (crashes) reported by VDAs.
+
+        ApplicationFaults has no Application navigation property — its fields
+        are Id, FaultingApplicationPath, ProcessName, SessionKey, Version,
+        Description, FaultReportedDate, BrowserNames, MachineId, with Session/
+        Machine nav properties only. `app_name` matches against ProcessName.
+        """
         filters = []
         if app_name:
-            filters.append(f"Application/Name eq '{app_name}'")
+            filters.append(f"contains(ProcessName, '{app_name}')")
 
-        from datetime import datetime, timedelta
         start_date = (datetime.utcnow() - timedelta(days=days)).isoformat() + "Z"
-        filters.append(f"CreatedDate ge {start_date}")
+        filters.append(f"FaultReportedDate ge {start_date}")
 
         combined_filter = " and ".join(filters) if filters else None
         return self.query(
             "ApplicationFaults",
             filter=combined_filter,
+            orderby="FaultReportedDate desc",
+        )
+
+    def get_application_errors(
+        self, app_name: str | None = None, days: int = 7
+    ) -> list[dict[str, Any]]:
+        """Get application error log entries (distinct from ApplicationFaults).
+
+        ApplicationErrors has no Application navigation property either —
+        same field shape as ApplicationFaults but with ErrorReportedDate.
+        `app_name` matches against ProcessName.
+        """
+        filters = []
+        if app_name:
+            filters.append(f"contains(ProcessName, '{app_name}')")
+
+        start_date = (datetime.utcnow() - timedelta(days=days)).isoformat() + "Z"
+        filters.append(f"ErrorReportedDate ge {start_date}")
+
+        combined_filter = " and ".join(filters) if filters else None
+        return self.query(
+            "ApplicationErrors",
+            filter=combined_filter,
+            orderby="ErrorReportedDate desc",
+        )
+
+    def get_application_activity_summary(
+        self, app_name: str | None = None, days: int = 7
+    ) -> list[dict[str, Any]]:
+        """Get application usage rollups by time period."""
+        filters = []
+        if app_name:
+            filters.append(f"Application/Name eq '{app_name}'")
+
+        start_date = (datetime.utcnow() - timedelta(days=days)).isoformat() + "Z"
+        filters.append(f"SummaryDate ge {start_date}")
+
+        combined_filter = " and ".join(filters) if filters else None
+        return self.query(
+            "ApplicationActivitySummaries",
+            filter=combined_filter,
             expand=["Application"],
-            orderby="CreatedDate desc",
+            orderby="SummaryDate desc",
         )
 
     # =========================================================================
@@ -537,7 +690,7 @@ class CitrixMonitorClient:
         return self.query("Hypervisors")
 
     def get_load_indexes(
-        self, machine_id: int | None = None, machine_name: str | None = None
+        self, machine_id: str | None = None, machine_name: str | None = None
     ) -> list[dict[str, Any]]:
         """Get load index data for machines."""
         if machine_name:
@@ -560,7 +713,6 @@ class CitrixMonitorClient:
         if delivery_group:
             filters.append(f"DesktopGroup/Name eq '{delivery_group}'")
 
-        from datetime import datetime, timedelta
         start_date = (datetime.utcnow() - timedelta(days=days)).isoformat() + "Z"
         filters.append(f"SummaryDate ge {start_date}")
 
@@ -571,6 +723,88 @@ class CitrixMonitorClient:
             expand=["DesktopGroup"],
             orderby="SummaryDate desc",
         )
+
+    def get_load_index_summary(
+        self,
+        machine_id: str | None = None,
+        machine_name: str | None = None,
+        days: int = 7,
+    ) -> list[dict[str, Any]]:
+        """Get load index averages by time period and machine."""
+        if machine_name:
+            machine = self.get_machine_by_name(machine_name)
+            if machine:
+                machine_id = machine.get("Id")
+
+        filters = []
+        if machine_id:
+            filters.append(f"MachineId eq {machine_id}")
+
+        start_date = (datetime.utcnow() - timedelta(days=days)).isoformat() + "Z"
+        filters.append(f"SummaryDate ge {start_date}")
+
+        combined_filter = " and ".join(filters) if filters else None
+        return self.query(
+            "LoadIndexSummaries",
+            filter=combined_filter,
+            orderby="SummaryDate desc",
+        )
+
+    # Process utilization granularity -> OData entity name
+    _PROCESS_UTIL_ENTITIES = {
+        "raw": "ProcessUtilization",
+        "minute": "ProcessUtilizationMinuteSummary",
+        "hour": "ProcessUtilizationHourSummary",
+        "day": "ProcessUtilizationDaySummary",
+    }
+
+    def get_process_utilization(
+        self,
+        machine_id: str | None = None,
+        machine_name: str | None = None,
+        granularity: str = "raw",
+        days: int = 1,
+        filter: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Get per-process CPU/memory utilization on a machine.
+
+        granularity: "raw" (per-sample), "minute", "hour", or "day" summary.
+        """
+        if machine_name:
+            machine = self.get_machine_by_name(machine_name)
+            if machine:
+                machine_id = machine.get("Id")
+
+        entity = self._PROCESS_UTIL_ENTITIES.get(granularity, "ProcessUtilization")
+        date_field = "CollectedDate" if entity == "ProcessUtilization" else "SummaryDate"
+
+        filters = []
+        if filter:
+            filters.append(filter)
+        if machine_id:
+            filters.append(f"MachineId eq {machine_id}")
+
+        start_date = (datetime.utcnow() - timedelta(days=days)).isoformat() + "Z"
+        filters.append(f"{date_field} ge {start_date}")
+
+        combined_filter = " and ".join(filters) if filters else None
+        return self.query(entity, filter=combined_filter, orderby=f"{date_field} desc")
+
+    def list_probe_rules(self, filter: str | None = None) -> list[dict[str, Any]]:
+        """List configured application probes."""
+        return self.query("ProbeRules", filter=filter)
+
+    def list_probe_endpoints(self, filter: str | None = None) -> list[dict[str, Any]]:
+        """List machines running the Citrix Probe Agent."""
+        return self.query("ProbeEndpoints", filter=filter)
+
+    def list_probe_results(self, filter: str | None = None, top: int | None = None) -> list[dict[str, Any]]:
+        """List probe run results, including failure stage."""
+        return self.query("ProbeResults", filter=filter, top=top)
+
+    def list_task_logs(self, filter: str | None = None, top: int | None = None) -> list[dict[str, Any]]:
+        """List internal Monitor Service task/job execution logs."""
+        return self.query("TaskLogs", filter=filter, top=top)
 
 
 # Global client instance

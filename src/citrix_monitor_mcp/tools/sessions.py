@@ -84,6 +84,43 @@ def get_tools() -> list[Tool]:
                 "required": [],
             },
         ),
+        Tool(
+            name="citrix_session_metrics",
+            description="Get per-session ICA/bandwidth metrics",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "session_key": {
+                        "type": "string",
+                        "description": "Session key (GUID)",
+                    },
+                    "filter": {
+                        "type": "string",
+                        "description": "Custom OData filter expression",
+                    },
+                },
+                "required": [],
+            },
+        ),
+        Tool(
+            name="citrix_session_activity_summary",
+            description="Get session count and logon activity rollups by time period",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "days": {
+                        "type": "integer",
+                        "description": "Number of days to look back (default: 7)",
+                        "default": 7,
+                    },
+                    "filter": {
+                        "type": "string",
+                        "description": "Custom OData filter expression",
+                    },
+                },
+                "required": [],
+            },
+        ),
     ]
 
 
@@ -119,6 +156,18 @@ def handle_tool(name: str, arguments: dict[str, Any]) -> Any:
             else:
                 filter_expr = "EndDate eq null"
         return {"count": client.get_count("Sessions", filter=filter_expr)}
+
+    elif name == "citrix_session_metrics":
+        return client.get_session_metrics(
+            session_key=arguments.get("session_key"),
+            filter=arguments.get("filter"),
+        )
+
+    elif name == "citrix_session_activity_summary":
+        return client.get_session_activity_summary(
+            days=arguments.get("days", 7),
+            filter=arguments.get("filter"),
+        )
 
     else:
         raise ValueError(f"Unknown tool: {name}")

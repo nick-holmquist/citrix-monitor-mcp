@@ -46,3 +46,6 @@ htmlcov/
 
 # mypy
 .mypy_cache/
+
+# Session memory (local context, not source)
+memory/

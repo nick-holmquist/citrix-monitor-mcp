@@ -6,6 +6,7 @@ from . import connections
 from . import applications
 from . import users
 from . import analytics
+from . import diagnostics
 
 __all__ = [
     "machines",
@@ -14,4 +15,5 @@ __all__ = [
     "applications",
     "users",
     "analytics",
+    "diagnostics",
 ]
